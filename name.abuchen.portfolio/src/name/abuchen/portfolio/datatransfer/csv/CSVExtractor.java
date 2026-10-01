@@ -25,6 +25,13 @@ import name.abuchen.portfolio.util.Isin;
 
 public abstract class CSVExtractor implements Extractor
 {
+    /**
+     * Key of the item data holding the 1-based line number (Integer) of the CSV
+     * line from which the item was extracted. Items that do not stem from a
+     * single line (e.g. securities created on the fly) carry none.
+     */
+    public static final String LINE_NUMBER = "csv-line-number"; //$NON-NLS-1$
+
     public abstract List<Field> getFields();
 
     public Field getField(String code)

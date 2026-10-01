@@ -827,6 +827,7 @@ public final class CSVImporter
 
     private Column[] columns;
     private List<String[]> values;
+    private String parseError;
 
     public CSVImporter(Client client, File file)
     {
@@ -922,6 +923,16 @@ public final class CSVImporter
         return values;
     }
 
+    /**
+     * Returns the error message if the last parse failed because the data is
+     * not well-formed CSV. In that case, the raw values and columns only
+     * contain the error message for display.
+     */
+    public Optional<String> getParseError()
+    {
+        return Optional.ofNullable(parseError);
+    }
+
     public Column[] getColumns()
     {
         return columns;
@@ -932,8 +943,20 @@ public final class CSVImporter
         this.columns = columns;
     }
 
-    private void processStream(InputStream stream, boolean remap) throws IOException
+    /**
+     * Parses the CSV data from the given stream with the current settings
+     * (delimiter, encoding, skipped lines, header). Used directly by callers
+     * that do not have a file, e.g. the REST API.
+     *
+     * @param remap
+     *            if true, the columns are re-created from the header and mapped
+     *            to the fields of the current extractor; if false, previously
+     *            configured columns are kept
+     */
+    public void processStream(InputStream stream, boolean remap) throws IOException
     {
+        parseError = null;
+
         Reader reader = new InputStreamReader(stream, encoding);
 
         CSVFormat strategy = CSVFormat.DEFAULT.builder().setDelimiter(delimiter).setQuote('"')
@@ -982,6 +1005,8 @@ public final class CSVImporter
         catch (IllegalStateException | UncheckedIOException e)
         {
             PortfolioLog.error(e);
+
+            parseError = e.getMessage();
 
             if (remap)
                 this.columns = new Column[] { new Column(0, Messages.LabelError) };

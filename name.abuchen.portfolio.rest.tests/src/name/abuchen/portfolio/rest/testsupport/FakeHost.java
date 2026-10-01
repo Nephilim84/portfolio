@@ -5,8 +5,10 @@ import java.util.List;
 import java.util.concurrent.Callable;
 
 import name.abuchen.portfolio.model.Client;
+import name.abuchen.portfolio.model.Security;
 import name.abuchen.portfolio.money.ExchangeRateProviderFactory;
 import name.abuchen.portfolio.rest.spi.ApiAccessRequest;
+import name.abuchen.portfolio.rest.spi.CsvConfiguration;
 import name.abuchen.portfolio.rest.spi.HostApplication;
 import name.abuchen.portfolio.rest.spi.OpenFile;
 
@@ -45,7 +47,79 @@ public class FakeHost implements HostApplication
         }
     }
 
+    /** an open file that tracks its dirty state and counts saves */
+    public static final class SavableFile implements OpenFile
+    {
+        private final String path;
+        private final Client client;
+        private final ExchangeRateProviderFactory factory;
+        private boolean dirty;
+        private int saves;
+
+        public SavableFile(String path, Client client)
+        {
+            this.path = path;
+            this.client = client;
+            this.factory = new ExchangeRateProviderFactory(client);
+            client.addPropertyChangeListener("dirty", event -> dirty = true); //$NON-NLS-1$
+        }
+
+        @Override
+        public String getPath()
+        {
+            return path;
+        }
+
+        @Override
+        public String getLabel()
+        {
+            return path;
+        }
+
+        @Override
+        public Client getClient()
+        {
+            return client;
+        }
+
+        @Override
+        public ExchangeRateProviderFactory getExchangeRateProviderFactory()
+        {
+            return factory;
+        }
+
+        @Override
+        public boolean isDirty()
+        {
+            return dirty;
+        }
+
+        public void setDirty(boolean dirty)
+        {
+            this.dirty = dirty;
+        }
+
+        @Override
+        public void save()
+        {
+            saves++;
+            dirty = false;
+        }
+
+        public int saves()
+        {
+            return saves;
+        }
+    }
+
+    /** one call of {@link HostApplication#afterImport} */
+    public record AfterImport(OpenFile file, List<Security> newInstruments)
+    {
+    }
+
     private final List<OpenFile> openFiles;
+    private List<CsvConfiguration> csvConfigurations = List.of();
+    private final List<AfterImport> afterImports = new ArrayList<>();
     private boolean userEditing = false;
     private ApiAccessRequest lastAccessRequest;
 
@@ -124,5 +198,27 @@ public class FakeHost implements HostApplication
     public ApiAccessRequest lastAccessRequest()
     {
         return lastAccessRequest;
+    }
+
+    public void setCsvConfigurations(List<CsvConfiguration> csvConfigurations)
+    {
+        this.csvConfigurations = csvConfigurations;
+    }
+
+    @Override
+    public List<CsvConfiguration> listCsvConfigurations()
+    {
+        return csvConfigurations;
+    }
+
+    @Override
+    public void afterImport(OpenFile file, List<Security> newInstruments)
+    {
+        afterImports.add(new AfterImport(file, newInstruments));
+    }
+
+    public List<AfterImport> afterImports()
+    {
+        return afterImports;
     }
 }

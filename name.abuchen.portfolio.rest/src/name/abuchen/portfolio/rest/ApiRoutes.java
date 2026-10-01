@@ -11,6 +11,8 @@ import name.abuchen.portfolio.model.Client;
 import name.abuchen.portfolio.money.ExchangeRateProviderFactory;
 import name.abuchen.portfolio.rest.internal.AccountsHandler;
 import name.abuchen.portfolio.rest.internal.ApiException;
+import name.abuchen.portfolio.rest.internal.CsvImportHandler;
+import name.abuchen.portfolio.rest.internal.CsvImportSession;
 import name.abuchen.portfolio.rest.internal.FileResolver;
 import name.abuchen.portfolio.rest.internal.FilesHandler;
 import name.abuchen.portfolio.rest.internal.HoldingsHandler;
@@ -25,6 +27,7 @@ import name.abuchen.portfolio.rest.internal.Response;
 import name.abuchen.portfolio.rest.internal.Router;
 import name.abuchen.portfolio.rest.internal.SecuritiesHandler;
 import name.abuchen.portfolio.rest.internal.TradesHandler;
+import name.abuchen.portfolio.rest.internal.TransactionsHandler;
 import name.abuchen.portfolio.rest.spi.HostApplication;
 import name.abuchen.portfolio.rest.spi.OpenFile;
 
@@ -43,6 +46,17 @@ public final class ApiRoutes
     /** Query parameters shared by both trade routes. */
     private static final String[] TRADE_PARAMS = { "status", "grouping", "costMethod", "taxesAndFees", //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
                     "reportingCurrency" }; //$NON-NLS-1$
+
+    /** Query parameters of the transaction list and the cash account statement. */
+    private static final String[] TRANSACTION_PARAMS = { "from", "to", "instrument", "account", "type" }; //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$ //$NON-NLS-5$
+
+    /**
+     * The body limit of the CSV import routes: the CSV travels inside the JSON
+     * body, base64-encoded if raw. Several years of a busy account fit with
+     * room to spare; the routes require a token, unlike the pairing endpoints
+     * whose limit stays at the default.
+     */
+    private static final int CSV_IMPORT_MAX_BODY_BYTES = 16 * 1024 * 1024;
 
     private ApiRoutes()
     {
@@ -91,6 +105,34 @@ public final class ApiRoutes
                         (client, req) -> Response.json(200, AccountsHandler.list(client))));
         router.add("GET", "/v1/files/{file}/cash-accounts/{uuid}", read(resolver, host, //$NON-NLS-1$ //$NON-NLS-2$
                         (client, req) -> Response.json(200, AccountsHandler.get(client, req.pathParam("uuid"))))); //$NON-NLS-1$
+        router.add("GET", "/v1/files/{file}/cash-accounts/{uuid}/statement", read(resolver, host, //$NON-NLS-1$ //$NON-NLS-2$
+                        (client, req) -> Response.json(200, TransactionsHandler.statement(client, req.pathParam("uuid"), //$NON-NLS-1$
+                                        req.queryParam("from"), req.queryParam("to")))), //$NON-NLS-1$ //$NON-NLS-2$
+                        "from", "to"); //$NON-NLS-1$ //$NON-NLS-2$
+
+        router.add("GET", "/v1/files/{file}/transactions", read(resolver, host, //$NON-NLS-1$ //$NON-NLS-2$
+                        (client, req) -> Response.json(200, TransactionsHandler.list(client, req.queryParam("from"), //$NON-NLS-1$
+                                        req.queryParam("to"), req.queryParam("instrument"), //$NON-NLS-1$ //$NON-NLS-2$
+                                        req.queryParam("account"), req.queryParam("type")))), //$NON-NLS-1$ //$NON-NLS-2$
+                        TRANSACTION_PARAMS);
+
+        // CSV import: what it accepts, then preview (no changes) and commit
+        router.add("GET", "/v1/files/{file}/csv-import/types", read(resolver, host, //$NON-NLS-1$ //$NON-NLS-2$
+                        (client, req) -> Response.json(200, CsvImportHandler.types(client))));
+        router.add("GET", "/v1/files/{file}/csv-import/configurations", read(resolver, host, //$NON-NLS-1$ //$NON-NLS-2$
+                        (client, req) -> Response.json(200, CsvImportHandler.configurations(host))));
+        router.add("POST", "/v1/files/{file}/csv-import/preview", CSV_IMPORT_MAX_BODY_BYTES, //$NON-NLS-1$ //$NON-NLS-2$
+                        readFile(resolver, host, (file, req) -> Response.json(200,
+                                        CsvImportSession.preview(file, host, parseObject(req)))));
+        router.add("POST", "/v1/files/{file}/csv-import", CSV_IMPORT_MAX_BODY_BYTES, write(resolver, host, //$NON-NLS-1$ //$NON-NLS-2$
+                        (file, req) -> Response.json(200, CsvImportSession.commit(file, host, parseObject(req)))));
+
+        router.add("POST", "/v1/files/{file}/save", onUiThread(host, request -> { //$NON-NLS-1$ //$NON-NLS-2$
+            var resolved = resolver.resolve(request.pathParam("file")); //$NON-NLS-1$
+            if (host.isUserEditing())
+                throw ApiException.locked();
+            return FilesHandler.save(resolved.access(), resolved.file());
+        }));
 
         router.add("GET", "/v1/files/{file}/investment-accounts", read(resolver, host, //$NON-NLS-1$ //$NON-NLS-2$
                         (client, req) -> Response.json(200, PortfoliosHandler.list(client))));
@@ -161,6 +203,16 @@ public final class ApiRoutes
         return onUiThread(host, request -> {
             var resolved = resolver.resolve(request.pathParam("file")); //$NON-NLS-1$
             return body.apply(resolved.file().getClient(), request);
+        });
+    }
+
+    /** like {@link #read}, for handlers that need the open file rather than only its client */
+    private static Router.Handler readFile(FileResolver resolver, HostApplication host,
+                    BiFunction<OpenFile, Request, Response> body)
+    {
+        return onUiThread(host, request -> {
+            var resolved = resolver.resolve(request.pathParam("file")); //$NON-NLS-1$
+            return body.apply(resolved.file(), request);
         });
     }
 

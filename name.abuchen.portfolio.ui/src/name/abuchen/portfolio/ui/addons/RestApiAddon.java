@@ -3,6 +3,7 @@ package name.abuchen.portfolio.ui.addons;
 import java.io.IOException;
 import java.text.MessageFormat;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicReference;
@@ -24,7 +25,9 @@ import org.eclipse.swt.widgets.Display;
 import org.osgi.service.event.Event;
 
 import name.abuchen.portfolio.PortfolioLog;
+import name.abuchen.portfolio.datatransfer.csv.CSVConfigManager;
 import name.abuchen.portfolio.model.Client;
+import name.abuchen.portfolio.model.Security;
 import name.abuchen.portfolio.money.ExchangeRateProviderFactory;
 import name.abuchen.portfolio.rest.ApiRoutes;
 import name.abuchen.portfolio.rest.FileAccessRegistry;
@@ -33,6 +36,7 @@ import name.abuchen.portfolio.rest.RestApiConstants;
 import name.abuchen.portfolio.rest.RestApiServer;
 import name.abuchen.portfolio.rest.RestApiWorkspace;
 import name.abuchen.portfolio.rest.spi.ApiAccessRequest;
+import name.abuchen.portfolio.rest.spi.CsvConfiguration;
 import name.abuchen.portfolio.rest.spi.HostApplication;
 import name.abuchen.portfolio.rest.spi.OpenFile;
 import name.abuchen.portfolio.ui.Messages;
@@ -41,6 +45,8 @@ import name.abuchen.portfolio.ui.dialogs.ApiAccessApprovalDialog;
 import name.abuchen.portfolio.ui.editor.ClientInput;
 import name.abuchen.portfolio.ui.editor.ClientInputFactory;
 import name.abuchen.portfolio.ui.editor.EditorActivationState;
+import name.abuchen.portfolio.ui.jobs.priceupdate.UpdatePricesJob;
+import name.abuchen.portfolio.ui.util.swt.ActiveShell;
 
 /**
  * Starts and stops the REST API server with the application and implements
@@ -82,6 +88,32 @@ public class RestApiAddon
             // created eagerly in ClientInput#setClient; listOpenFiles filters
             // inputs without a client, so this is never null here
             return input.getExchangeRateProviderFacory();
+        }
+
+        @Override
+        public boolean isDirty()
+        {
+            return input.isDirty();
+        }
+
+        @Override
+        public void save() throws IOException
+        {
+            // the same code path as the user's "Save" command, including the
+            // backup; ClientInput reports a failure in an error dialog and
+            // keeps the file dirty, which is how the failure is detected here
+            var shell = ActiveShell.get();
+            if (shell == null || shell.isDisposed())
+                shell = Display.getDefault().getActiveShell();
+            if (shell == null && Display.getDefault().getShells().length > 0)
+                shell = Display.getDefault().getShells()[0];
+            if (shell == null)
+                throw new IOException("no application window to save from"); //$NON-NLS-1$
+
+            input.save(shell);
+
+            if (input.isDirty())
+                throw new IOException(MessageFormat.format("{0} is still unsaved after saving", input.getLabel())); //$NON-NLS-1$
         }
     }
 
@@ -138,6 +170,25 @@ public class RestApiAddon
         {
             Display.getDefault().asyncExec(() -> showApprovalWhenIdle(this, request));
         }
+
+        @Override
+        public List<CsvConfiguration> listCsvConfigurations()
+        {
+            var result = new ArrayList<CsvConfiguration>();
+            configManager.getBuiltInConfigurations().forEach(c -> result.add(new CsvConfiguration(c, true)));
+            configManager.getUserSpecificConfigurations().forEach(c -> result.add(new CsvConfiguration(c, false)));
+            return result;
+        }
+
+        @Override
+        public void afterImport(OpenFile file, List<Security> newInstruments)
+        {
+            // like the import wizard, fetch prices for new instruments (some,
+            // e.g. crypto currencies, come with a working configuration); the
+            // dialog to configure the remaining feeds is left to the user
+            if (!newInstruments.isEmpty())
+                new UpdatePricesJob(file.getClient(), newInstruments).schedule();
+        }
     }
 
     @Inject
@@ -145,6 +196,9 @@ public class RestApiAddon
 
     @Inject
     private ECommandService commandService;
+
+    @Inject
+    private CSVConfigManager configManager;
 
     @Inject
     private EHandlerService handlerService;

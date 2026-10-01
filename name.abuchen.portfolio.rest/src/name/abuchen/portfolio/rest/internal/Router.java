@@ -15,11 +15,21 @@ public class Router
         Response handle(Request request) throws Exception;
     }
 
-    public record Match(Handler handler, Map<String, String> pathParams)
+    /**
+     * The largest request body accepted by default. Handlers parse JSON, so a
+     * body is buffered whole - without a limit any local process could make the
+     * application allocate arbitrary amounts of memory, and the pairing
+     * endpoints do not even require a token. A JSON merge patch of a portfolio
+     * entity is orders of magnitude smaller than this.
+     */
+    public static final int DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
+
+    public record Match(Handler handler, Map<String, String> pathParams, int maxBodyBytes)
     {
     }
 
-    private record Route(String method, String[] segments, Set<String> queryParams, Handler handler)
+    private record Route(String method, String[] segments, Set<String> queryParams, int maxBodyBytes,
+                    Handler handler)
     {
     }
 
@@ -31,11 +41,22 @@ public class Router
      */
     public void add(String method, String pattern, Handler handler, String... queryParams)
     {
+        add(method, pattern, DEFAULT_MAX_BODY_BYTES, handler, queryParams);
+    }
+
+    /**
+     * Registers a route that accepts request bodies up to the given size -
+     * for endpoints whose payload is a document (e.g. a CSV file) rather than
+     * a small JSON object. Only routes that require a token may raise the
+     * limit.
+     */
+    public void add(String method, String pattern, int maxBodyBytes, Handler handler, String... queryParams)
+    {
         // declaration order is the specification's order, which reads better in
         // the error message than an alphabetical list would
         var permitted = new LinkedHashSet<>(List.of(queryParams));
 
-        routes.add(new Route(method, split(pattern), permitted, request -> {
+        routes.add(new Route(method, split(pattern), permitted, maxBodyBytes, request -> {
             rejectUnknownQueryParams(request, permitted);
             return handler.handle(request);
         }));
@@ -53,7 +74,7 @@ public class Router
                 continue;
             pathMatched = true;
             if (route.method().equals(method))
-                return new Match(route.handler(), params);
+                return new Match(route.handler(), params, route.maxBodyBytes());
         }
 
         if (pathMatched)
@@ -71,6 +92,15 @@ public class Router
         return routes.stream() //
                         .map(Router::signatureOf) //
                         .toList();
+    }
+
+    /** The body size limit of each route, keyed like {@link #routeSignatures()}. */
+    public Map<String, Integer> maxBodyBytes()
+    {
+        var result = new LinkedHashMap<String, Integer>();
+        for (Route route : routes)
+            result.put(signatureOf(route), route.maxBodyBytes());
+        return result;
     }
 
     /**

@@ -79,7 +79,8 @@ be added later without breaking clients.
 
 ```json
 {"items": [
-  {"id": "5f3c…", "alias": "main", "label": "portfolio.xml", "path": "/Users/me/portfolio.xml"}
+  {"id": "5f3c…", "alias": "main", "label": "portfolio.xml", "path": "/Users/me/portfolio.xml",
+   "dirty": false}
 ]}
 ```
 
@@ -133,12 +134,111 @@ on a client's behalf. Watchlist and taxonomy membership do not block the delete.
 {"uuid": "d9f0…", "name": "Broker", "referenceCashAccount": "c4b2…", "note": "…"}
 ```
 
-## Writes are not saved
+### `GET /v1/files/{file}/transactions`
 
-A write mutates the in-memory file and marks it dirty, exactly as if you had edited it in the UI —
-the change is visible immediately, and the user saves it (or discards it by closing without saving).
-**There is no save endpoint in v1.** If your script needs the change on disk, the user has to press
-save.
+The bookings of the file, oldest first. Filters: `from`, `to` (ISO dates, inclusive), `instrument`,
+`account` (a cash or investment account uuid) and `type` (comma-separated, e.g. `deposit,removal`).
+Without `account`, a buy, sell or transfer is listed once and names its other side as
+`counterpart`; with `account`, every booking of that account is listed. Money fields are magnitudes
+— the direction is the `type` (ADR 0003).
+
+```json
+{"uuid": "…", "date": "2024-01-05T00:00:00", "type": "removal",
+ "cashAccount": {"uuid": "c4b2…", "name": "Giro", "currencyCode": "EUR"},
+ "amount": {"value": 61.2, "currency": "EUR"}, "note": "Groceries"}
+```
+
+### `GET /v1/files/{file}/cash-accounts/{uuid}/statement?from=&to=`
+
+What a bank statement shows, computed from the file: `openingBalance`, every booking with its signed
+`cashFlow` and running `balance`, `closingBalance`, `totalCredits`/`totalDebits`. The terms reconcile —
+`openingBalance + Σ cashFlow = closingBalance` — so a line-by-line comparison with the bank's
+statement shows where the two diverge. Bookings that look like duplicates of each other (same day,
+type, amount, shares and instrument) name each other in `potentialDuplicateOf`.
+
+### CSV import — `…/csv-import/preview` and `…/csv-import`
+
+Imports a CSV with the application's **own** CSV importer: the same column mapping, the same
+extractors, the same checks as the import wizard's review page, and the same insert. The API adds
+what a program needs to verify an import instead of eyeballing it.
+
+| Route | |
+|---|---|
+| `GET /v1/files/{file}/csv-import/types` | import types, their fields (`code`, `kind`, `required`), date/amount formats, transaction type values |
+| `GET /v1/files/{file}/csv-import/configurations` | the configurations saved in the import wizard — reference one by `label` |
+| `POST /v1/files/{file}/csv-import/preview` | evaluate, **change nothing** |
+| `POST /v1/files/{file}/csv-import` | evaluate again and insert what passes |
+
+Import types: `cash-account-transactions` (a bank statement), `investment-account-transactions` (a
+broker's transaction list), `instruments`, `instrument-prices` (needs `instrument`), `holdings`.
+
+The smallest request — a CSV whose headers are field codes needs no mapping at all:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:5712/v1/files/main/csv-import/preview \
+  -d '{"type": "cash-account-transactions",
+       "csv": "date,value,note\n2024-01-02,2500.00,Salary\n2024-01-05,-61.20,Groceries\n"}'
+```
+
+A bank's own export, mapped explicitly (German number format, a preamble line):
+
+```json
+{"type": "cash-account-transactions",
+ "csvBase64": "…", "encoding": "windows-1252", "skipLines": 1,
+ "decimalSeparator": ",", "dateFormat": "dd.MM.yyyy",
+ "columns": [{"header": "Buchungstag", "field": "date"},
+             {"header": "Betrag",      "field": "value"},
+             {"header": "Verwendungszweck", "field": "note"},
+             {"header": "Umsatzart", "field": "type",
+              "format": {"deposit": "Gutschrift|Lohn", "removal": "Lastschrift|Kartenzahlung"}}],
+ "cashAccounts": ["c4b2…"],
+ "expectedBalances": [{"date": "2024-01-31", "balance": 4923.81}]}
+```
+
+Or let the user set the bank's format up once in the wizard and save it — then
+`{"configuration": "My Bank", "csvBase64": "…"}` is the whole request.
+
+What the report tells you:
+
+- `columns` — every column with its field, format and a `sample` value. Check this first.
+- `items[]` — per CSV `line`: what would be booked (`type`, `date`, `amount`, `instrument`, the
+  resolved `cashAccount`/`investmentAccount`), `status`, `messages` (each with a `check` code), and
+  `import` with a `reason` if not. A `duplicate` warning names the existing transaction in
+  `potentialDuplicateOf`; a `duplicate-in-file` warning the other CSV lines in `repeatsLines`; a
+  `target` error says which account is missing and lists the candidates.
+- `parseErrors[]` — lines that produced no row, with `line` and `message`.
+- `balances[]` — per cash account booked on: `balanceBefore + importedCashFlow = balanceAfter` at
+  the last booked day. Projected in a preview, read back from the file on commit.
+- `reconciliation[]` — per `expectedBalances` entry: `match`/`mismatch` and the `difference`.
+- on commit: `createdInstruments`, and `consistencyIssues` from the application's consistency check.
+
+Rows with warnings are imported only if their line is in `acceptWarnings`; `excludeLines` keeps
+lines out; errors are never imported. Without `cashAccounts`, a currency defaults to the only active
+cash account in it (reported as `defaulted`), the same for the investment account; transfer targets
+never default. Unknown keys are `422`, as is a mapping that misses a required field — the message
+lists the columns. The body may be up to 16 MiB.
+
+#### Reconciling a bank statement
+
+1. **Preview** with the statement's closing balance in `expectedBalances`.
+2. **Resolve the findings**: exclude wrong lines, accept genuine repetitions, fix the mapping —
+   until `reconciliation` says `match`. A remaining `mismatch` means the file deviated before the
+   import; the account `statement` shows from which booking on.
+3. **Commit** the same body and check the report.
+4. **Save** — `POST /v1/files/{file}/save`.
+
+### `POST /v1/files/{file}/save`
+
+Saves the file exactly like the user's Save command, backup included, and returns the file with
+`dirty: false`; a file without changes is not written. `409 save-failed` if writing failed — the
+application shows the user why.
+
+## Writes are not saved until you save
+
+A write (`PATCH`, `DELETE`, a CSV import) mutates the in-memory file and marks it dirty (`dirty` in
+`GET /v1/files`), exactly as if you had edited it in the UI — the change is visible immediately. It
+reaches the disk when saved: by the user, or by `POST /v1/files/{file}/save`. Until then the user
+can still discard it by closing the file without saving.
 
 ## Errors
 
@@ -160,6 +260,8 @@ save.
 | 409 | `file-not-open` | file is enabled but not currently open — a human has to open it |
 | 409 | `ambiguous-alias` | alias matches several records; use the UUID |
 | 409 | `delete-blocked` | instrument is referenced by transactions or plans |
+| 409 | `save-failed` | the file could not be written to disk |
+| 413 | `request-too-large` | body over 1 MiB (16 MiB for the CSV import) |
 | 422 | `validation` | one or more fields rejected; see `errors` |
 | 423 | `user-interaction` | a dialog is open in the app — **retry**, see `Retry-After` |
 | 429 | `pairing-pending` | another pairing request awaits the user — retry after `Retry-After` |

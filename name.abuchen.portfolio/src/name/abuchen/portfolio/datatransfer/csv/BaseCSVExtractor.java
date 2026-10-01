@@ -2,7 +2,6 @@ package name.abuchen.portfolio.datatransfer.csv;
 
 import static name.abuchen.portfolio.util.TextUtil.trim;
 
-import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.text.MessageFormat;
@@ -10,7 +9,6 @@ import java.text.ParseException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -88,12 +86,15 @@ import name.abuchen.portfolio.money.Money;
 
             try
             {
+                int before = result.size();
                 extract(result, trimmed, field2column);
+
+                for (int ii = before; ii < result.size(); ii++)
+                    result.get(ii).setData(LINE_NUMBER, lineNo);
             }
             catch (ParseException | UnsupportedOperationException | IllegalArgumentException e)
             {
-                errors.add(new IOException(MessageFormat.format(Messages.CSVLineXwithMsgY, lineNo, e.getMessage(),
-                                Arrays.toString(trimmed)), e));
+                errors.add(new CSVLineException(lineNo, e.getMessage(), trimmed, e));
             }
             lineNo++;
         }

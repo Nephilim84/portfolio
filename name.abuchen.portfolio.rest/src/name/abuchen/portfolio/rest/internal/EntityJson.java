@@ -146,6 +146,7 @@ public final class EntityJson
             json.addProperty("alias", access.alias()); //$NON-NLS-1$
         json.addProperty("label", file.getLabel()); //$NON-NLS-1$
         json.addProperty("path", file.getPath()); //$NON-NLS-1$
+        json.addProperty("dirty", file.isDirty()); //$NON-NLS-1$
         return json;
     }
 
@@ -424,7 +425,7 @@ public final class EntityJson
      * Only toPlainString avoids both, so the token is built from it and parsed
      * back into a number.
      */
-    private static JsonElement decimal(BigDecimal value)
+    static JsonElement decimal(BigDecimal value)
     {
         // stripTrailingZeros is documented to misbehave for zero
         var plain = value.signum() == 0 ? "0" : value.stripTrailingZeros().toPlainString(); //$NON-NLS-1$
@@ -558,7 +559,7 @@ public final class EntityJson
      * the name travels with it so that a response is readable without a second
      * call.
      */
-    private static JsonObject reference(Security security)
+    static JsonObject reference(Security security)
     {
         var json = new JsonObject();
         json.addProperty("uuid", security.getUUID()); //$NON-NLS-1$
@@ -567,7 +568,16 @@ public final class EntityJson
         return json;
     }
 
-    private static JsonObject reference(Portfolio portfolio)
+    static JsonObject reference(Account account)
+    {
+        var json = new JsonObject();
+        json.addProperty("uuid", account.getUUID()); //$NON-NLS-1$
+        json.addProperty("name", account.getName()); //$NON-NLS-1$
+        json.addProperty("currencyCode", account.getCurrencyCode()); //$NON-NLS-1$
+        return json;
+    }
+
+    static JsonObject reference(Portfolio portfolio)
     {
         var json = new JsonObject();
         json.addProperty("uuid", portfolio.getUUID()); //$NON-NLS-1$

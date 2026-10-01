@@ -51,9 +51,10 @@ info:
       point its own domain at 127.0.0.1 and reach the API.
     - **No browser origin.** Any request that carries an `Origin` header is rejected
       `403 browser-origin-forbidden`. A web page therefore cannot reach this API.
-    - **Bounded request body.** A body larger than 1 MiB is rejected
-      `413 request-too-large` without being read to the end. Every legitimate
-      request is far smaller; the limit exists because bodies are buffered whole.
+    - **Bounded request body.** A body larger than 1 MiB — 16 MiB for the CSV
+      import, whose body carries a whole file — is rejected
+      `413 request-too-large` without being read to the end. The limit exists
+      because bodies are buffered whole.
     - **Per-file access.** Only files the user has individually enabled are visible.
       A file that exists but is not enabled answers exactly like one that does not
       exist (`404 not-found`) — the token must not let a client enumerate files the
@@ -61,9 +62,10 @@ info:
 
     ## Methods
 
-    A path serves only the methods listed for it in this document; the only
-    `POST` endpoint is the pairing request — v1 has **no create endpoints for
-    portfolio data**. Calling any method that a path does not list returns
+    A path serves only the methods listed for it in this document. Portfolio
+    data is created only through the **CSV import**, which reuses the
+    application's own importer and its checks rather than accepting raw
+    transactions. Calling any method that a path does not list returns
     `405 method-not-allowed`.
 
     ## Query parameters
@@ -86,17 +88,39 @@ info:
     is rejected, not treated as `reportingCurrency`. Accepting a case variant
     would mean guessing, and the response says so, naming the parameter meant.
 
-    ## Writes are not saved
+    ## Writes are not saved until you save
 
-    A write (`PATCH`, `DELETE`) mutates the **in-memory** file and marks it dirty,
-    exactly as if the user had edited it in the UI. The change is visible
-    immediately, but **there is no save endpoint** — only the user saves the file
-    (or discards the change by closing without saving).
+    A write (`PATCH`, `DELETE`, a CSV import) mutates the **in-memory** file and
+    marks it dirty (`dirty` on `GET /v1/files`), exactly as if the user had
+    edited it in the UI. The change is visible immediately, but reaches the disk
+    only when saved — by the user, or by `POST /v1/files/{file}/save`. Until
+    then the user can still discard it by closing the file without saving.
 
     While the user has a modal dialog open or is editing a table cell, writes are
     rejected with `423 user-interaction` rather than silently clobbered. This is
     **normal and temporary**: respect the `Retry-After` header and try again. Reads
     are unaffected.
+
+    ## Reconciling a bank statement
+
+    The CSV import is built to be verified, not trusted:
+
+    1. `GET /v1/files`, then `GET .../cash-accounts` to find the account the
+       statement belongs to. Optionally `GET .../csv-import/configurations`, if
+       the user saved the bank's format in the import wizard.
+    2. `POST .../csv-import/preview` with the CSV, the account in
+       `cashAccounts`, and the statement's closing balance in
+       `expectedBalances`. Check `columns` (is every column mapped as meant?),
+       `parseErrors`, and the rows that will not be imported: a `duplicate`
+       warning names the existing transaction in `potentialDuplicateOf`, a
+       `duplicate-in-file` warning the other line in `repeatsLines`.
+    3. Decide per row — `excludeLines` what is wrong, `acceptWarnings` what is
+       a genuine repetition — until `reconciliation` says `match`. A
+       `mismatch` that remains means the file already deviated before the
+       import: find where with `GET .../cash-accounts/{uuid}/statement`, whose
+       running `balance` can be compared line by line with the bank's.
+    4. `POST .../csv-import` with the same body, check the report, then
+       `POST .../save`.
 
 servers:
   - url: http://127.0.0.1:{port}
@@ -128,6 +152,10 @@ tags:
     description: Return and value-change of the file over an interval
   - name: Trades
     description: Matched buy/sell pairs, computed from the transactions
+  - name: Transactions
+    description: The bookings of cash accounts and investment accounts
+  - name: CSV import
+    description: Import CSV files - bank statements, broker exports - with the application's own importer
 
 paths:
   /v1/openapi.yaml:
@@ -281,12 +309,51 @@ paths:
                         alias: main
                         label: portfolio.xml
                         path: /Users/me/portfolio.xml
+                        dirty: false
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/files/{file}/save:
+    parameters:
+      - $ref: "#/components/parameters/File"
+    post:
+      operationId: saveFile
+      tags: [Files]
+      summary: Save the file to disk
+      description: |
+        Saves the file exactly like the user's **Save** command — including the
+        backup the user may have configured — and returns the file with
+        `dirty: false`. A file without unsaved changes is not written again;
+        that is not an error.
+
+        Writes of the API (and of the user) stay in memory until saved, so call
+        this after a commit you have verified. If the user interacts with the
+        application, the save is rejected `423` like any write; retry later.
+      responses:
+        "200":
+          description: The file, now saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/File"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "423":
+          $ref: "#/components/responses/Locked"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -609,6 +676,341 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/files/{file}/transactions:
+    parameters:
+      - $ref: "#/components/parameters/File"
+    get:
+      operationId: listTransactions
+      tags: [Transactions]
+      summary: List transactions
+      description: |
+        The transactions of the file, oldest first. Without `account`, a
+        booking with two sides — a buy or sell (investment account and cash
+        account), a transfer — is listed **once**: from the investment account,
+        resp. the sending side, naming the other side as `counterpart`. With
+        `account`, every transaction of that one account is listed, including
+        the cash side of buys and sells.
+      parameters:
+        - name: from
+          in: query
+          description: First booking day to include (ISO 8601 date, inclusive).
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          description: Last booking day to include (ISO 8601 date, inclusive).
+          schema:
+            type: string
+            format: date
+        - name: instrument
+          in: query
+          description: Only transactions of this instrument (uuid).
+          schema:
+            type: string
+        - name: account
+          in: query
+          description: Only transactions of this cash account or investment account (uuid).
+          schema:
+            type: string
+        - name: type
+          in: query
+          description: |
+            Only these transaction types, comma-separated, e.g. `deposit,removal`.
+            The values are those of `Transaction.type`.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The transactions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Transaction"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/files/{file}/cash-accounts/{uuid}/statement:
+    parameters:
+      - $ref: "#/components/parameters/File"
+      - $ref: "#/components/parameters/Uuid"
+    get:
+      operationId: getCashAccountStatement
+      tags: [Cash accounts]
+      summary: The statement of a cash account, for reconciliation
+      description: |
+        What a bank statement shows, computed from the file: the balance at the
+        start of `from`, every booking of the period with its signed `cashFlow`
+        and the running `balance`, and the balance at the end of `to`. Compare
+        it line by line with the bank's statement to find where the two diverge.
+
+        The terms reconcile:
+        `openingBalance + Σ items[].cashFlow = closingBalance`, which is why
+        `cashFlow` is signed while `amount` is a magnitude (see ADR 0003).
+        Bookings that the import would consider duplicates of each other (same
+        day, type, amount, shares and instrument) name each other in
+        `potentialDuplicateOf`.
+      parameters:
+        - name: from
+          in: query
+          description: |
+            First booking day (ISO 8601 date, inclusive). Defaults to the day of
+            the first booking of the account.
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          description: Last booking day (ISO 8601 date, inclusive). Defaults to today.
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: The statement
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CashAccountStatement"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/files/{file}/csv-import/types:
+    parameters:
+      - $ref: "#/components/parameters/File"
+    get:
+      operationId: listCsvImportTypes
+      tags: [CSV import]
+      summary: What a CSV import can import, and the fields of each type
+      description: |
+        The import types and, per type, the fields a CSV column can be assigned
+        to — with the formats of date and amount fields and the values of the
+        `type` field. The fields depend on the file: an `instruments` import has
+        a field per custom attribute.
+
+        A column whose header is a field `code` (case and `-`/`_`/spaces
+        ignored) is assigned to that field automatically, so a CSV written for
+        the API needs no `columns` at all.
+      responses:
+        "200":
+          description: The import types
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CsvImportType"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/files/{file}/csv-import/configurations:
+    parameters:
+      - $ref: "#/components/parameters/File"
+    get:
+      operationId: listCsvImportConfigurations
+      tags: [CSV import]
+      summary: The CSV configurations saved in the import wizard
+      description: |
+        The configurations the user saved in the application's CSV import
+        wizard (and the built-in ones): delimiter, encoding, skipped lines and
+        the column mapping for one bank's export format. Pass a `label` as
+        `configuration` to import with that mapping — let the user set up a
+        bank's format once in the wizard, then import its statements by name.
+      responses:
+        "200":
+          description: The configurations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CsvConfiguration"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/files/{file}/csv-import/preview:
+    parameters:
+      - $ref: "#/components/parameters/File"
+    post:
+      operationId: previewCsvImport
+      tags: [CSV import]
+      summary: Evaluate a CSV import without changing the file
+      description: |
+        Parses the CSV, maps its columns, and runs the checks of the
+        application's import wizard on every row — without changing anything.
+        The report tells, per row, whether it **would be imported** and why not,
+        names existing transactions a row may duplicate, flags rows that repeat
+        other rows of the same CSV, and projects the balance of every cash
+        account the import books on. With `expectedBalances` from the bank
+        statement it also reconciles: `difference` is what the file would still
+        be off by after the import.
+
+        Iterate on the preview — adjust `columns`, `excludeLines` and
+        `acceptWarnings` — until the report is what you intend, then send the
+        same body to `POST .../csv-import`.
+
+        The body may be up to 16 MiB.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CsvImportRequest"
+            examples:
+              bankStatement:
+                summary: A bank statement, reconciled against its closing balance
+                value:
+                  type: cash-account-transactions
+                  csv: |
+                    date,value,note
+                    2024-01-02,2500.00,Salary
+                    2024-01-05,-61.20,Groceries
+                  cashAccounts: [3f0b6c1e-6a2d-4f7e-9b0a-1c2d3e4f5a6b]
+                  expectedBalances:
+                    - date: "2024-01-31"
+                      balance: 4321.09
+      responses:
+        "200":
+          description: |
+            The report. An `instrument-prices` import answers with a
+            `CsvPriceImportReport` instead.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/CsvImportReport"
+                  - $ref: "#/components/schemas/CsvPriceImportReport"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/files/{file}/csv-import:
+    parameters:
+      - $ref: "#/components/parameters/File"
+    post:
+      operationId: commitCsvImport
+      tags: [CSV import]
+      summary: Import a CSV
+      description: |
+        Evaluates the CSV exactly like the preview — again, as the file may have
+        changed in between — and inserts every row that passes: rows without
+        findings, and rows with warnings whose line is in `acceptWarnings`. Rows
+        with errors and rows in `excludeLines` are never imported. The report
+        has the shape of the preview's, with `dryRun: false`; `import` tells
+        what *was* imported and `balanceAfter` is read back from the file.
+
+        Instruments the CSV refers to but the file does not hold are created
+        (`createdInstruments`), and the application starts fetching their
+        prices. `consistencyIssues` lists what the application's consistency
+        check finds afterwards — e.g. a sale of more shares than are held.
+
+        The import is **not saved**: verify it (e.g. with the statement of the
+        cash account), then `POST .../save`.
+
+        The body may be up to 16 MiB.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CsvImportRequest"
+      responses:
+        "200":
+          description: |
+            The report. An `instrument-prices` import answers with a
+            `CsvPriceImportReport` instead.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/CsvImportReport"
+                  - $ref: "#/components/schemas/CsvPriceImportReport"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/RequestTooLarge"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+        "423":
+          $ref: "#/components/responses/Locked"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -1603,7 +2005,7 @@ components:
     File:
       type: object
       description: An open, enabled portfolio file you may address.
-      required: [id, label, path]
+      required: [id, label, path, dirty]
       properties:
         id:
           type: string
@@ -1621,6 +2023,11 @@ components:
           description: |
             The file's path on disk. Identity is keyed by path, so a *different*
             file copied over an enabled path inherits that path's access.
+        dirty:
+          type: boolean
+          description: |
+            True if the file has changes - of the API or of the user - that are
+            not saved to disk yet. See `POST /v1/files/{file}/save`.
 
     PairingRequestCreated:
       type: object
@@ -2239,6 +2646,775 @@ components:
             peak. This is **not** the duration of the deepest drawdown, which is
             a different and shorter interval — hence the name.
 
+    CashAccountReference:
+      type: object
+      description: |
+        A pointer to a cash account. Join to `GET .../cash-accounts/{uuid}` by
+        `uuid`.
+      required: [uuid, name, currencyCode]
+      properties:
+        uuid:
+          type: string
+        name:
+          type: string
+        currencyCode:
+          type: string
+
+    TransactionType:
+      type: string
+      description: |
+        The kind of booking: the model's own transaction types. Cash account
+        transactions are `deposit`, `removal` (a withdrawal), `interest`,
+        `interest-charge`, `dividends`, `fees`, `fees-refund`, `taxes`,
+        `tax-refund`, `buy`, `sell`, `transfer-in` and `transfer-out`;
+        investment account transactions are `buy`, `sell`, `transfer-in`,
+        `transfer-out`, `delivery-inbound` and `delivery-outbound`.
+      enum:
+        - deposit
+        - removal
+        - interest
+        - interest-charge
+        - dividends
+        - fees
+        - fees-refund
+        - taxes
+        - tax-refund
+        - buy
+        - sell
+        - transfer-in
+        - transfer-out
+        - delivery-inbound
+        - delivery-outbound
+
+    Transaction:
+      type: object
+      description: |
+        One booking of a cash account or an investment account. Exactly one of
+        `cashAccount` and `investmentAccount` is present: the account that holds
+        it. Money fields are **magnitudes** as the model stores them (ADR 0003);
+        the direction of a booking is its `type`.
+      required: [uuid, date, type, amount]
+      properties:
+        uuid:
+          type: string
+          description: The transaction's persistent identity.
+        date:
+          type: string
+          description: Booking date and time, local, always with seconds (`2024-01-02T00:00:00`).
+        type:
+          $ref: "#/components/schemas/TransactionType"
+        cashAccount:
+          $ref: "#/components/schemas/CashAccountReference"
+        investmentAccount:
+          $ref: "#/components/schemas/PortfolioReference"
+        amount:
+          $ref: "#/components/schemas/MonetaryValue"
+        instrument:
+          $ref: "#/components/schemas/InstrumentReference"
+        shares:
+          type: number
+          description: Number of shares, present whenever an instrument is.
+        fees:
+          $ref: "#/components/schemas/MonetaryValue"
+        taxes:
+          $ref: "#/components/schemas/MonetaryValue"
+        grossValue:
+          type: object
+          description: The value before fees and taxes, with its foreign-currency counterpart if any.
+          properties:
+            amount:
+              $ref: "#/components/schemas/MonetaryValue"
+            forex:
+              $ref: "#/components/schemas/MonetaryValue"
+            exchangeRate:
+              type: number
+        exDate:
+          type: string
+          description: Ex-date of a dividend, if known.
+        note:
+          type: string
+        source:
+          type: string
+          description: Where the booking came from, e.g. the name of an imported document.
+        counterpart:
+          type: object
+          description: |
+            The other side of a two-sided booking: the cash side of a buy, the
+            receiving side of a transfer.
+          required: [uuid, type]
+          properties:
+            uuid:
+              type: string
+            type:
+              $ref: "#/components/schemas/TransactionType"
+            cashAccount:
+              $ref: "#/components/schemas/CashAccountReference"
+            investmentAccount:
+              $ref: "#/components/schemas/PortfolioReference"
+
+    CashAccountStatement:
+      type: object
+      description: |
+        The bookings of one cash account in a period, as a bank statement shows
+        them. `openingBalance + Σ items[].cashFlow = closingBalance`.
+      required: [cashAccount, from, to, openingBalance, closingBalance, totalCredits, totalDebits, items]
+      properties:
+        cashAccount:
+          $ref: "#/components/schemas/CashAccountReference"
+        from:
+          type: string
+          format: date
+        to:
+          type: string
+          format: date
+        openingBalance:
+          $ref: "#/components/schemas/MonetaryValue"
+        closingBalance:
+          $ref: "#/components/schemas/MonetaryValue"
+        totalCredits:
+          $ref: "#/components/schemas/MonetaryValue"
+        totalDebits:
+          $ref: "#/components/schemas/MonetaryValue"
+        items:
+          type: array
+          items:
+            allOf:
+              - $ref: "#/components/schemas/Transaction"
+              - type: object
+                required: [cashFlow, balance]
+                properties:
+                  cashFlow:
+                    $ref: "#/components/schemas/MonetaryValue"
+                    description: The signed effect on the balance (credits positive, debits negative).
+                  balance:
+                    $ref: "#/components/schemas/MonetaryValue"
+                    description: The balance after this booking.
+                  potentialDuplicateOf:
+                    type: array
+                    description: Other bookings of this account with the same day, type, amount, shares and instrument.
+                    items:
+                      type: string
+
+    CsvImportType:
+      type: object
+      required: [type, label, fields]
+      properties:
+        type:
+          type: string
+          enum: [cash-account-transactions, investment-account-transactions, instruments, instrument-prices, holdings]
+          description: |
+            `cash-account-transactions` — a bank statement: deposits,
+            withdrawals, interest, fees, dividends, and buys/sells booked from
+            the cash side. `investment-account-transactions` — a broker's
+            transaction list. `instruments` — a list of instruments.
+            `instrument-prices` — the price history of one instrument.
+            `holdings` — a statement of assets, imported as purchases.
+        label:
+          type: string
+          description: The type's name in the application's language.
+        fields:
+          type: array
+          items:
+            type: object
+            required: [code, label, required, kind]
+            properties:
+              code:
+                type: string
+                description: |
+                  The field's stable code, as used by `columns[].field` and by
+                  saved configurations (e.g. `date`, `value`, `type`, `isin`,
+                  `shares`, `fees`, `taxes`, `note`, `currency`).
+              label:
+                type: string
+                description: The field's name in the application's language.
+              required:
+                type: boolean
+              kind:
+                type: string
+                enum: [date, amount, type, isin, text]
+              formats:
+                type: array
+                description: |
+                  For `date` and `amount` fields: the predefined formats. A date
+                  column also takes any other `SimpleDateFormat` pattern.
+                items:
+                  type: string
+              values:
+                type: array
+                description: For the `type` field, the transaction types it can take.
+                items:
+                  type: string
+
+    CsvConfiguration:
+      type: object
+      required: [label, builtIn, columns]
+      properties:
+        label:
+          type: string
+          description: The name to pass as `configuration`.
+        type:
+          type: string
+          description: The import type the configuration is made for.
+        builtIn:
+          type: boolean
+          description: True if it ships with the application, false if the user saved it.
+        delimiter:
+          type: string
+        encoding:
+          type: string
+        skipLines:
+          type: integer
+        firstLineHeader:
+          type: boolean
+        columns:
+          type: array
+          description: The columns by position. Columns without `field` are ignored.
+          items:
+            type: object
+            required: [index, header]
+            properties:
+              index:
+                type: integer
+              header:
+                type: string
+              field:
+                type: string
+              format:
+                type: string
+
+    CsvImportRequest:
+      type: object
+      description: |
+        A CSV and how to import it. Only `csv` (or `csvBase64`) and `type` (or
+        `configuration`) are needed; everything else has a default or is
+        detected. Unknown keys are rejected `422` — a misspelled option must not
+        silently fall back to its default.
+      properties:
+        type:
+          type: string
+          enum: [cash-account-transactions, investment-account-transactions, instruments, instrument-prices, holdings]
+          description: What the CSV contains. Optional when `configuration` is given.
+        csv:
+          type: string
+          description: The CSV as text.
+        csvBase64:
+          type: string
+          description: The CSV as raw bytes, base64-encoded — for files that are not UTF-8.
+        encoding:
+          type: string
+          description: |
+            The character encoding of `csvBase64`, e.g. `ISO-8859-1` or
+            `windows-1252`. Defaults to that of the `configuration`, else UTF-8.
+        configuration:
+          type: string
+          description: |
+            The `label` of a saved configuration
+            (`GET .../csv-import/configurations`): its delimiter, encoding,
+            skipped lines and column mapping apply. Any option given here
+            overrides the configuration's.
+        delimiter:
+          type: string
+          enum: [",", ";", "\t", "|"]
+          description: Detected from the first line read when omitted.
+        skipLines:
+          type: integer
+          minimum: 0
+          description: Lines to skip before the header, e.g. a bank's preamble. Default 0.
+        firstLineHeader:
+          type: boolean
+          description: Whether the first line read is a header. Default true.
+        decimalSeparator:
+          type: string
+          enum: [".", ","]
+          description: |
+            The decimal separator of all amount columns that have no own
+            `format`, e.g. `,` for German bank exports (`1.234,56`). When
+            omitted it is detected per column from the values whose last
+            separator is followed by one or two digits (`12,50`, `-61.20`);
+            without such evidence it is `.`. The report's `columns` show the
+            result — check it, as a wrong separator yields wrong amounts, not
+            errors.
+        dateFormat:
+          type: string
+          description: |
+            The date pattern of all date columns that have no own `format`, e.g.
+            `dd.MM.yyyy`. When omitted it is guessed per column from its first
+            value.
+        columns:
+          type: array
+          description: |
+            Assignments of fields to columns, applied on top of the automatic
+            mapping (by field code, by the application's own column names, or
+            by the configuration).
+          items:
+            $ref: "#/components/schemas/CsvColumnAssignment"
+        cashAccounts:
+          type: array
+          description: |
+            The cash accounts to book on, at most one per currency (uuids). A
+            currency not covered defaults to the only active cash account in
+            that currency, if there is exactly one; the report says which
+            accounts were `defaulted`. A row whose currency has no account is an
+            error that names the candidates.
+          items:
+            type: string
+        investmentAccount:
+          type: string
+          description: |
+            The investment account to book instrument transactions on (uuid).
+            Defaults to the only active one, if there is exactly one.
+        targetCashAccounts:
+          type: array
+          description: The receiving cash accounts of transfers, at most one per currency. Never defaulted.
+          items:
+            type: string
+        targetInvestmentAccount:
+          type: string
+          description: The receiving investment account of transfers. Never defaulted.
+        instrument:
+          type: string
+          description: For `instrument-prices` (and only for it, and required there) the instrument to import into.
+        convertBuySellToDelivery:
+          type: boolean
+          description: Book buys and sells as deliveries, without cash. Default false.
+        removeDividends:
+          type: boolean
+          description: Book a withdrawal right after each dividend, so dividends do not stay in the cash account. Default false.
+        importNotes:
+          type: boolean
+          description: Import the note column. Default true.
+        excludeLines:
+          type: array
+          description: Line numbers (as in the report's `line`) not to import.
+          items:
+            type: integer
+        acceptWarnings:
+          type: array
+          description: |
+            Line numbers whose warnings — typically a potential duplicate — you
+            have checked and accept: these rows are imported despite them.
+          items:
+            type: integer
+        itemDetail:
+          type: string
+          enum: [all, issues, none]
+          description: |
+            Which rows the report lists: `all` (default), `issues` (rows with
+            findings or not to be imported) or `none` (summary only — for large
+            files).
+        expectedBalances:
+          type: array
+          description: Balances from the bank statement to reconcile the import against.
+          items:
+            type: object
+            required: [date, balance]
+            properties:
+              cashAccount:
+                type: string
+                description: The cash account (uuid). Optional if the import books on exactly one.
+              date:
+                type: string
+                format: date
+                description: The day at whose end the balance holds, e.g. the statement's closing date.
+              balance:
+                type: number
+                description: The balance as the bank states it, e.g. `4321.09` (a string is accepted too).
+
+    CsvColumnAssignment:
+      type: object
+      description: Assigns a field (and optionally a format) to one column, addressed by `index` or `header`.
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: The 0-based position of the column.
+        header:
+          type: string
+          description: The header of the column (exact, else case-insensitive).
+        field:
+          type: [string, "null"]
+          description: |
+            The field code (see `GET .../csv-import/types`). `null` removes an
+            automatic assignment; omit it to only change the format.
+        format:
+          description: |
+            For a date column, a pattern such as `dd.MM.yyyy`; for an amount
+            column `0,000.00` (or `.`) or `0.000,00` (or `,`); for the type
+            column, an object from transaction type to a regular expression,
+            e.g. `{"deposit": "Gutschrift|Lohn", "removal": "Lastschrift"}`,
+            searched in the value like in the import wizard. Without it, the
+            type column accepts the application's own labels and the
+            `TransactionType` values, case-insensitively.
+          oneOf:
+            - type: string
+            - type: object
+              additionalProperties:
+                type: string
+
+    CsvImportMessage:
+      type: object
+      required: [severity, check, message]
+      properties:
+        severity:
+          type: string
+          enum: [warning, error, skipped]
+          description: A warning blocks the import of the row unless accepted; an error always does.
+        check:
+          type: string
+          description: |
+            What raised it: `duplicate` (an existing transaction looks the same
+            — see `potentialDuplicateOf`), `duplicate-in-file` (another row of
+            this CSV looks the same — see `repeatsLines`), `target` (no account
+            to book on — the message names the candidates), `extraction`, or one
+            of the wizard's checks: `transaction-date`, `transaction-type`,
+            `instrument-values`, `currency`, `forex-gross-value`.
+        message:
+          type: string
+          description: Human-readable, in the application's language where it comes from the application.
+
+    CsvImportItem:
+      type: object
+      description: One row of the CSV, as it would be (or was) booked.
+      required: [kind, status, messages, import]
+      properties:
+        line:
+          type: integer
+          description: |
+            The 1-based line of the CSV the row comes from — the key to use in
+            `excludeLines` and `acceptWarnings`. Absent for instruments created
+            on the fly for transactions.
+        kind:
+          type: string
+          enum: [cash-account-transaction, investment-account-transaction, buy-sell, cash-transfer, investment-transfer, instrument, instrument-update, other]
+        type:
+          type: string
+          description: The `TransactionType`, or `transfer`.
+        date:
+          type: string
+          format: date
+        amount:
+          $ref: "#/components/schemas/MonetaryValue"
+        shares:
+          type: number
+        fees:
+          $ref: "#/components/schemas/MonetaryValue"
+        taxes:
+          $ref: "#/components/schemas/MonetaryValue"
+        instrument:
+          type: object
+          required: [name, new]
+          properties:
+            uuid:
+              type: string
+              description: Absent in a preview for an instrument the import would create.
+            name:
+              type: string
+            currencyCode:
+              type: string
+            isin:
+              type: string
+            wkn:
+              type: string
+            tickerSymbol:
+              type: string
+            new:
+              type: boolean
+              description: True if the file does not hold the instrument yet (resp. it was created by this import).
+        note:
+          type: string
+        cashAccount:
+          $ref: "#/components/schemas/CashAccountReference"
+        investmentAccount:
+          $ref: "#/components/schemas/PortfolioReference"
+        targetCashAccount:
+          $ref: "#/components/schemas/CashAccountReference"
+        targetInvestmentAccount:
+          $ref: "#/components/schemas/PortfolioReference"
+        status:
+          type: string
+          enum: [ok, warning, error, skipped]
+          description: The most severe of `messages`.
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/CsvImportMessage"
+        potentialDuplicateOf:
+          type: array
+          description: The uuids of existing transactions this row looks the same as.
+          items:
+            type: string
+        repeatsLines:
+          type: array
+          description: Other lines of this CSV that look the same as this row.
+          items:
+            type: integer
+        import:
+          type: boolean
+          description: In a preview, whether the row would be imported; on commit, whether it was.
+        reason:
+          type: string
+          enum: [excluded, error, skipped, warning-not-accepted, not-referenced]
+          description: Why the row is not imported.
+
+    CsvImportReport:
+      type: object
+      required: [dryRun, type, settings, columns, targets, summary, parseErrors, balances, reconciliation]
+      properties:
+        dryRun:
+          type: boolean
+          description: True for a preview — nothing was changed.
+        type:
+          type: string
+        configuration:
+          type: string
+          description: The configuration applied, if any.
+        settings:
+          type: object
+          description: The settings the CSV was read with — detected ones included.
+          properties:
+            delimiter:
+              type: string
+            encoding:
+              type: string
+            skipLines:
+              type: integer
+            firstLineHeader:
+              type: boolean
+        columns:
+          type: array
+          description: |
+            Every column of the CSV with the field assigned to it, if any, the
+            format, and a sample value. Check this first: a wrong mapping
+            explains most surprises.
+          items:
+            type: object
+            required: [index, header]
+            properties:
+              index:
+                type: integer
+              header:
+                type: string
+              sample:
+                type: string
+                description: The first non-empty value of the column.
+              field:
+                type: string
+              fieldLabel:
+                type: string
+              format:
+                description: A string for date and amount columns, an object for the type column.
+        targets:
+          type: object
+          description: The accounts the rows are booked on; `defaulted` tells which were not given but inferred.
+          properties:
+            cashAccounts:
+              type: array
+              items:
+                allOf:
+                  - $ref: "#/components/schemas/CashAccountReference"
+                  - type: object
+                    properties:
+                      defaulted:
+                        type: boolean
+            investmentAccount:
+              allOf:
+                - $ref: "#/components/schemas/PortfolioReference"
+                - type: object
+                  properties:
+                    defaulted:
+                      type: boolean
+            targetCashAccounts:
+              type: array
+              items:
+                $ref: "#/components/schemas/CashAccountReference"
+            targetInvestmentAccount:
+              $ref: "#/components/schemas/PortfolioReference"
+        summary:
+          type: object
+          required: [lines, items, ok, warnings, errors, skipped, excluded, duplicates, parseErrors, import, newInstruments]
+          properties:
+            lines:
+              type: integer
+              description: Data lines read (after skipped lines and the header).
+            items:
+              type: integer
+            ok:
+              type: integer
+            warnings:
+              type: integer
+            errors:
+              type: integer
+            skipped:
+              type: integer
+            excluded:
+              type: integer
+            duplicates:
+              type: integer
+              description: Rows that look like an existing transaction or like another row.
+            parseErrors:
+              type: integer
+              description: Lines that could not be read at all — see `parseErrors`.
+            import:
+              type: integer
+              description: Rows that would be (preview) resp. were (commit) imported.
+            newInstruments:
+              type: integer
+        items:
+          type: array
+          description: Absent with `itemDetail: none`.
+          items:
+            $ref: "#/components/schemas/CsvImportItem"
+        parseErrors:
+          type: array
+          description: Lines that produced no row — a value that does not parse, a missing required value.
+          items:
+            type: object
+            required: [message]
+            properties:
+              line:
+                type: integer
+              message:
+                type: string
+        balances:
+          type: array
+          description: |
+            Per cash account the import books on, at the end of the last day it
+            books on: `balanceBefore + importedCashFlow = balanceAfter`
+            (`importedCashFlow` is signed). Projected in a preview, read back
+            from the file on commit.
+          items:
+            type: object
+            required: [cashAccount, date, balanceBefore, importedCashFlow, balanceAfter]
+            properties:
+              cashAccount:
+                $ref: "#/components/schemas/CashAccountReference"
+              date:
+                type: string
+                format: date
+              balanceBefore:
+                $ref: "#/components/schemas/MonetaryValue"
+              importedCashFlow:
+                $ref: "#/components/schemas/MonetaryValue"
+              balanceAfter:
+                $ref: "#/components/schemas/MonetaryValue"
+        reconciliation:
+          type: array
+          description: |
+            One entry per `expectedBalances` entry: the balance of the file at
+            the end of `date` after the import, against the bank's.
+            `difference = expected - balanceAfter`; a mismatch means rows are
+            missing, duplicated or wrong — compare with
+            `GET .../cash-accounts/{uuid}/statement`.
+          items:
+            type: object
+            required: [date, status]
+            properties:
+              cashAccount:
+                $ref: "#/components/schemas/CashAccountReference"
+              date:
+                type: string
+                format: date
+              expected:
+                description: The expected balance (a plain number if `status` is `unresolved`).
+              balanceBefore:
+                $ref: "#/components/schemas/MonetaryValue"
+              balanceAfter:
+                $ref: "#/components/schemas/MonetaryValue"
+              difference:
+                $ref: "#/components/schemas/MonetaryValue"
+              status:
+                type: string
+                enum: [match, mismatch, unresolved]
+              message:
+                type: string
+                description: Why the entry is `unresolved`.
+        createdInstruments:
+          type: array
+          description: Commit only. The instruments the import created.
+          items:
+            $ref: "#/components/schemas/InstrumentReference"
+        consistencyIssues:
+          type: array
+          description: Commit only. What the application's consistency check finds after the import.
+          items:
+            type: object
+            required: [message]
+            properties:
+              date:
+                type: string
+                format: date
+              message:
+                type: string
+              cashAccount:
+                $ref: "#/components/schemas/CashAccountReference"
+              investmentAccount:
+                $ref: "#/components/schemas/PortfolioReference"
+              instrument:
+                $ref: "#/components/schemas/InstrumentReference"
+
+    CsvPriceImportReport:
+      type: object
+      description: The report of an `instrument-prices` import.
+      required: [dryRun, type, settings, columns, instrument, summary, parseErrors]
+      properties:
+        dryRun:
+          type: boolean
+        type:
+          type: string
+          enum: [instrument-prices]
+        configuration:
+          type: string
+        settings:
+          type: object
+        columns:
+          type: array
+          items:
+            type: object
+        instrument:
+          $ref: "#/components/schemas/InstrumentReference"
+        summary:
+          type: object
+          required: [lines, prices, new, changed, unchanged, parseErrors]
+          properties:
+            lines:
+              type: integer
+            prices:
+              type: integer
+            new:
+              type: integer
+            changed:
+              type: integer
+            unchanged:
+              type: integer
+            parseErrors:
+              type: integer
+        items:
+          type: array
+          description: With `itemDetail: issues`, only changed prices.
+          items:
+            type: object
+            required: [date, value, status]
+            properties:
+              date:
+                type: string
+                format: date
+              value:
+                type: number
+              previousValue:
+                type: number
+              status:
+                type: string
+                enum: [new, changed, unchanged]
+        parseErrors:
+          type: array
+          items:
+            type: object
+            properties:
+              line:
+                type: integer
+              message:
+                type: string
+
     FieldError:
       type: object
       description: One field-level violation within a `Problem`.
@@ -2289,8 +3465,10 @@ components:
             **409** kinds each call for a different response:
             `file-not-open` (a human must open the file), `ambiguous-alias` (retry
             with the `id`), `delete-blocked` (give up — the instrument is referenced).
+            A fourth, `save-failed`, means the file could not be written to disk;
+            the application shows the user why.
             `method-not-allowed` (405) is returned for any method a path does not
-            list; v1 has no create endpoints.
+            list.
           enum:
             - https://portfolio-performance.info/rest/problems/invalid-request
             - https://portfolio-performance.info/rest/problems/unauthorized
@@ -2303,6 +3481,7 @@ components:
             - https://portfolio-performance.info/rest/problems/file-not-open
             - https://portfolio-performance.info/rest/problems/ambiguous-alias
             - https://portfolio-performance.info/rest/problems/delete-blocked
+            - https://portfolio-performance.info/rest/problems/save-failed
             - https://portfolio-performance.info/rest/problems/validation
             - https://portfolio-performance.info/rest/problems/user-interaction
             - https://portfolio-performance.info/rest/problems/pairing-pending
@@ -2393,9 +3572,9 @@ components:
       description: |
         The addressed file or entity cannot serve the request in its current state:
         `file-not-open` (enabled but not open — a human must open it),
-        `ambiguous-alias` (the alias matches several records — use the `id`), or, on
+        `ambiguous-alias` (the alias matches several records — use the `id`), on
         delete, `delete-blocked` (the instrument is referenced by transactions or
-        plans).
+        plans), or, on save, `save-failed` (the file could not be written).
       content:
         application/problem+json:
           schema:
@@ -2445,6 +3624,15 @@ components:
           description: Seconds to wait before retrying.
           schema:
             type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    RequestTooLarge:
+      description: |
+        The request body exceeds the limit of the endpoint (`request-too-large`):
+        16 MiB for the CSV import, 1 MiB for every other endpoint.
       content:
         application/problem+json:
           schema:
