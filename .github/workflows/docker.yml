@@ -1,0 +1,99 @@
+name: Docker Image
+
+# Builds the Linux product with Maven and packages it as a container image
+# (the desktop application on a virtual display, plus the REST API), pushed
+# to the GitHub Container Registry as ghcr.io/<owner>/portfolio-performance.
+on:
+  push:
+    branches:
+      - master
+      - 'feature/**'
+    tags:
+      - '*'
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache Maven artifacts
+        uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository
+          # Include .target files: Tycho resolves OSGi dependencies from the
+          # target platform definition, which is not captured by pom.xml alone
+          key: ${{ runner.os }}-mvn-${{ hashFiles('**/pom.xml', '**/*.target') }}
+          restore-keys: |
+            ${{ runner.os }}-mvn-
+
+      - name: Set up Zulu JDK 21
+        uses: actions/setup-java@v6
+        with:
+          java-version: 21
+          distribution: zulu
+
+      - name: Set up Maven 3.9.16
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: 3.9.16
+
+      # the tests run in the CI workflow; here only the product is needed
+      - name: Build the product
+        run: |
+          mvn verify \
+            --batch-mode \
+            -DskipTests \
+            --file portfolio-app/pom.xml
+
+      - name: Stage the Linux products for the image
+        run: docker/stage-product.sh
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/portfolio-performance
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
